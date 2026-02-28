@@ -1,120 +1,116 @@
-/**
- * @file main.cpp
- * @brief Test e verifica array sensori VL53L4CX
- * @details Inizializza il ToFManager e stampa le letture sulla seriale.
- */
-
 #include <Arduino.h>
 #include <Wire.h>
-#include "ToFManager.h"
-
-// Includiamo Pins.h per avere accesso a PIN_SDA e PIN_SCL
+#include <Adafruit_NeoPixel.h>
 #include "Pins.h"
+#include "Constants.h"
+#include "ColorManager.h"
 
-// Istanza globale del Manager
-ToFManager tofManager;
+#define PIN_RGB_LED 48
+#define NUM_PIXELS 1
 
-// Timer per la stampa seriale (per non rallentare il loop di lettura)
+Adafruit_NeoPixel pixels(NUM_PIXELS, PIN_RGB_LED, NEO_GRB + NEO_KHZ800);
+ColorManager colorMgr;
+
 unsigned long lastPrintTime = 0;
-const unsigned long PRINT_INTERVAL_MS = 100; // Stampa ogni 100ms
+const unsigned long PRINT_INTERVAL = 200;
 
-void printSensorValue(const char* label, int16_t distance, bool isValid) {
-    Serial.print("[");
-    Serial.print(label);
-    Serial.print(":");
-
-    if (distance == -1) Serial.print("OFF"); // Sensore rotto/non avviato
-    else if (distance == 8888){ Serial.print("---"); // Sensore OK, ma vuoto davanti
-    } else if (!isValid) {
-        // Il sensore è online, ma la lettura non è affidabile (Sigma fail, Target perso, etc.)
-        // Spesso accade se si punta verso il vuoto o superfici nere opache
-        Serial.print("INV");
-        // Opzionale: stampa comunque la distanza grezza per debug
-        // Serial.print("("); Serial.print(distance); Serial.print(")");
-    } else {
-        // Lettura valida
-        if (distance < 100) Serial.print(" "); // Allineamento estetico
-        if (distance < 10)  Serial.print(" ");
-        Serial.print(distance);
-    }
-    Serial.print("] ");
+void printMenu() {
+    Serial.println("\n--- CLIMBER COLOR VISUALIZER ---");
+    Serial.println("[w] -> Calibra BIANCO (Reference)");
+    Serial.println("[n] -> Calibra NERO (Soglia dinamica)");
+    Serial.println("[r] -> Calibra ROSSO");
+    Serial.println("[b] -> Calibra BLU");
+    Serial.println("[e] -> ESPORTA Calibrazioni per Constants.h"); // NUOVO COMANDO
+    Serial.println("--------------------------------");
 }
 
 void setup() {
-    // 1. Inizializzazione Seriale
+    delay(2000); // Essenziale per ESP32-S3 USB Nativa
     Serial.begin(115200);
-    // Attesa opzionale per vedere i messaggi di boot se connesso via USB nativa
-    delay(2000);
 
-    Serial.println("\n\n=============================================");
-    Serial.println("   VL53L4CX Array - System Verification");
-    Serial.println("=============================================");
+    pixels.begin();
+    pixels.setBrightness(20);
+    pixels.clear();
+    pixels.show();
 
-    // 2. Inizializzazione I2C
-    // È fondamentale definire i pin corretti qui
     Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
-    Wire.setClock(400000); // 400kHz Fast Mode raccomandato per 5 sensori
 
-    // 3. Avvio del Manager dei Sensori
-    // Questo metodo gestirà la sequenza XSHUT -> Indirizzamento
-    Serial.println(">> Inizializzazione Sensori in corso...");
-    bool systemStatus = tofManager.begin(&Wire);
-
-    if (systemStatus) {
-        Serial.println(">> Inizializzazione completata (Almeno un sensore attivo).");
-    } else {
-        Serial.println(">> ERRORE CRITICO: Nessun sensore rilevato!");
-        Serial.println("   Controllare cablaggio, alimentazione e pin XSHUT.");
-        // In un sistema reale, qui potresti fermare tutto o attivare un LED di errore
+    if (!colorMgr.begin(&Wire)) {
+        Serial.println("ERRORE: AS7262 non trovato!");
+        while (1) { delay(100); }
     }
 
-    Serial.println("=============================================\n");
-    Serial.println("Legenda: [Distanza mm] | 'OFF' = Offline | 'INV' = Misura non valida (Out of range/Noisy)");
-    delay(1000);
+    Serial.println("Sensore OK.");
+    printMenu();
+}
+
+void handleSerialInput() {
+    if (Serial.available()) {
+        char cmd = Serial.read();
+        while(Serial.available() && isSpace(Serial.peek())) Serial.read();
+
+        switch (cmd) {
+            case 'w': colorMgr.calibrate(COLOR_WHITE); Serial.println("BIANCO Calibrato."); break;
+            case 'n': colorMgr.calibrate(COLOR_BLACK); Serial.println("NERO Calibrato."); break;
+            case 'r': colorMgr.calibrate(COLOR_RED);   Serial.println("ROSSO Calibrato."); break;
+            case 'b': colorMgr.calibrate(COLOR_BLUE);  Serial.println("BLU Calibrato."); break;
+            case 'e':
+                // NUOVO COMANDO: Stampa i valori su Seriale
+                colorMgr.exportCalibrationToSerial();
+                break;
+        }
+    }
 }
 
 void loop() {
-    // ---------------------------------------------------------
-    // 1. FASE CRITICA: Aggiornamento Macchina a Stati
-    // ---------------------------------------------------------
-    // Questa funzione DEVE essere chiamata il più spesso possibile.
-    // Non contiene delay() e controlla solo se i dati sono pronti.
-    tofManager.update();
+    colorMgr.update();
+    handleSerialInput();
 
-    // ---------------------------------------------------------
-    // 2. FASE DI REPORTING (Ogni 100ms)
-    // ---------------------------------------------------------
-    if (millis() - lastPrintTime >= PRINT_INTERVAL_MS) {
+    // ==========================================
+    // LOGICA LED CON COLORI PURI ASSOLUTI
+    // ==========================================
+    ColorType detected = colorMgr.getDominantColor();
+
+    if (detected == COLOR_BLACK) {
+        pixels.setPixelColor(0, pixels.Color(0, 0, 0)); // Spento
+    }
+    else if (detected == COLOR_SILVER) {
+        // Effetto lampeggiante per l'Argento
+        if ((millis() / 100) % 2 == 0) pixels.setPixelColor(0, pixels.Color(255, 255, 255));
+        else pixels.setPixelColor(0, pixels.Color(0, 0, 0));
+    }
+    else if (detected == COLOR_RED) {
+        pixels.setPixelColor(0, pixels.Color(255, 0, 0)); // ROSSO PURO ASSOLUTO
+    }
+    else if (detected == COLOR_BLUE) {
+        pixels.setPixelColor(0, pixels.Color(0, 0, 255)); // BLU PURO ASSOLUTO
+    }
+    else if (detected == COLOR_WHITE) {
+        pixels.setPixelColor(0, pixels.Color(255, 255, 255)); // BIANCO PURO ASSOLUTO
+    }
+    else {
+        // Se non è sicuro (es. sul parquet o in transizione),
+        // usiamo la conversione RGB grezza riutilizzando il metodo isolato.
+        RGBColor raw = colorMgr.getVisualRGB();
+        pixels.setPixelColor(0, pixels.Color(raw.r, raw.g, raw.b));
+    }
+
+    pixels.show();
+
+    // Debug Seriale
+    if (millis() - lastPrintTime > PRINT_INTERVAL) {
+        const SpectralData& data = colorMgr.getCurrentData();
+
+        Serial.printf("SUM: %6.1f | Detect: ", data.sum);
+        switch(detected) {
+            case COLOR_BLACK: Serial.print("NERO (BUCO)"); break;
+            case COLOR_SILVER: Serial.print("ARGENTO (CHECKPOINT)"); break;
+            case COLOR_WHITE: Serial.print("BIANCO"); break;
+            case COLOR_RED: Serial.print("ROSSO"); break;
+            case COLOR_BLUE: Serial.print("BLU"); break;
+            default: Serial.print("SCONOSCIUTO"); break;
+        }
+        Serial.println();
         lastPrintTime = millis();
-
-        // Recupera l'ultima istantanea dei dati
-        ToFData readings = tofManager.getReadings();
-
-        // Stampa formattata
-        Serial.print("Distances (mm): ");
-
-        // Iteriamo sui 5 sensori basandoci sull'Enum definito in ToFManager.h
-        // Ordine: FL -> FR -> BL -> BR -> Center
-
-        // Front Left
-        printSensorValue("FL", readings.distance_mm[TOF_FRONT_LEFT], readings.valid[TOF_FRONT_LEFT]);
-
-        // Front Right
-        printSensorValue("FR", readings.distance_mm[TOF_FRONT_RIGHT], readings.valid[TOF_FRONT_RIGHT]);
-
-        // Back Left
-        printSensorValue("BL", readings.distance_mm[TOF_BACK_LEFT], readings.valid[TOF_BACK_LEFT]);
-
-        // Back Right
-        printSensorValue("BR", readings.distance_mm[TOF_BACK_RIGHT], readings.valid[TOF_BACK_RIGHT]);
-
-        // Center
-        printSensorValue("CT", readings.distance_mm[TOF_CENTER], readings.valid[TOF_CENTER]);
-
-        Serial.println(); // Nuova riga
     }
 }
-
-/**
- * @brief Helper per stampare in modo ordinato il valore di un sensore
- */

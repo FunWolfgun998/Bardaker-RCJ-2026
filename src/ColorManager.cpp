@@ -1,188 +1,238 @@
 #include "ColorManager.h"
 
-ColorManager::ColorManager() {
-    for(int i=0; i<6; i++) _channelValues[i] = 0.0f;
-    _calData.calibrated = false;
-    _calData.global_intensity_white = 1000.0f;
+ColorManager::ColorManager() : _isMeasuring(false), _lastUpdate(0) {
+    memset(&_currentData, 0, sizeof(SpectralData));
 }
 
-bool ColorManager::begin() {
-    Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
+bool ColorManager::begin(TwoWire* i2cBus, bool ledOn) {
+    _wire = i2cBus;
 
-    // Tentativo di connessione
-    if (!_as7262.begin(&Wire)) {
-        Serial.println("ERRORE: Sensore AS7262 non trovato!");
+    if (!_sensor.begin(_wire)) {
+        log_e("AS7262 non trovato!");
         return false;
     }
 
     // Configurazione Sensore
-    _as7262.setConversionType(MODE_2);
+    _sensor.setIntegrationTime(AS7262_INTEGRATION_VALUE);
+    _sensor.setGain(AS7262_GAIN_VALUE);
 
-    // Imposta tempo integrazione (valore * 2.8ms)
-    // Se AS7262_INTEGRATION_VALUE è 10 -> 28ms
-    _as7262.setIntegrationTime(AS7262_INTEGRATION_VALUE);
-
-    // FIX: Rimosso casting errato. La funzione accetta uint8_t (0, 1, 2, 3)
-    // 0=1x, 1=3.7x, 2=16x, 3=64x
-    _as7262.setGain(AS7262_GAIN_VALUE);
-
-    // LED Default ON
-    setLedCurrent(0); // 0 = 12.5mA (Default safe)
-    enableLed(true);
+    // LED Always On di default per garantire stabilità termica e illuminazione
+    enableLed(ledOn);
+    setLedCurrent(3); // 25mA, bilanciamento tra luminosità e calore
 
     loadCalibration();
+
+    // Avvia la prima misurazione asincrona
+    _sensor.startMeasurement();
+    _isMeasuring = true;
+
     return true;
 }
 
-void ColorManager::enableLed(bool enable) {
-    if (enable) {
-        _as7262.drvOn(); // Accende il driver LED
-    } else {
-        _as7262.drvOff();
-    }
-}
-
-void ColorManager::setLedCurrent(uint8_t current_level) {
-    // Mapping: 0=12.5mA, 1=25mA, 2=50mA, 3=100mA
-    if (current_level > 3) current_level = 3;
-
-    // FIX: Rimosso casting errato. La funzione accetta uint8_t.
-    _as7262.setDrvCurrent(current_level);
-}
-
 void ColorManager::update() {
-    // Controllo asincrono
-    if (!_as7262.dataReady()) {
-        return;
-    }
+    // Controllo asincrono: il task non viene mai bloccato.
+    if (_isMeasuring && _sensor.dataReady()) {
 
-    // Lettura dei 6 canali
-    uint16_t rawReadings[6];
-    _as7262.readRawValues(rawReadings);
+        // Lettura RAW calibrata (compensata internamente dal chip)
+        float newChannels[CH_COUNT];
+        newChannels[V] = _sensor.readCalibratedViolet();
+        newChannels[B] = _sensor.readCalibratedBlue();
+        newChannels[G] = _sensor.readCalibratedGreen();
+        newChannels[Y] = _sensor.readCalibratedYellow();
+        newChannels[O] = _sensor.readCalibratedOrange();
+        newChannels[R] = _sensor.readCalibratedRed();
 
-    // Filtro EMA (Exponential Moving Average)
-    for(int i=0; i<6; i++) {
-        _channelValues[i] = (EMA_ALPHA * (float)rawReadings[i]) + ((1.0f - EMA_ALPHA) * _channelValues[i]);
-    }
-}
+        float newSum = 0;
 
-void ColorManager::calibrate(ColorType colorTarget) {
-    // Calibrazione bloccante (si fa solo a robot fermo)
-    float avgSum = 0;
-    int samples = 20;
-
-    for(int i=0; i<samples; i++) {
-        // Attesa attiva dei dati
-        while(!_as7262.dataReady()) { delay(5); }
-
-        uint16_t temp[6];
-        _as7262.readRawValues(temp);
-        for(int k=0; k<6; k++) avgSum += temp[k];
-    }
-
-    avgSum /= samples; // Media della somma totale
-
-    if (colorTarget == COLOR_WHITE) {
-        _calData.global_intensity_white = avgSum;
-        _calData.calibrated = true;
-        saveCalibration();
-    }
-}
-
-void ColorManager::loadCalibration() {
-    _prefs.begin("color_cal", true); // Read-only
-    _calData.calibrated = _prefs.getBool("is_cal", false);
-    if(_calData.calibrated) {
-        _calData.global_intensity_white = _prefs.getFloat("int_w", 1000.0f);
-    }
-    _prefs.end();
-}
-
-void ColorManager::saveCalibration() {
-    _prefs.begin("color_cal", false); // Read-write
-    _prefs.putBool("is_cal", true);
-    _prefs.putFloat("int_w", _calData.global_intensity_white);
-    _prefs.end();
-}
-
-float ColorManager::getSum() {
-    float sum = 0;
-    for(int i=0; i<6; i++) sum += _channelValues[i];
-    return sum;
-}
-
-float ColorManager::getNormalized(int channelIndex) {
-    float sum = getSum();
-    if(sum < 1.0f) return 0.0f; // Evita divisione per zero
-    return _channelValues[channelIndex] / sum;
-}
-
-bool ColorManager::isBlack() {
-    // Se la luce totale è sotto la soglia minima -> Buco/Nero
-    return getSum() < DEFAULT_BLACK_THRESHOLD;
-}
-
-bool ColorManager::isSilver() {
-    float sum = getSum();
-
-    // 1. Saturazione Hardware (Riflesso speculare estremo)
-    if (sum > 50000.0f) return true;
-
-    // 2. Controllo rispetto alla calibrazione del bianco
-    if (_calData.calibrated) {
-        // L'argento riflette molto più del bianco diffuso (es. > 1.5x)
-        if (sum > (_calData.global_intensity_white * DEFAULT_SILVER_RATIO)) {
-            return true;
+        // Applica Filtro EMA (Exponential Moving Average) e calcola Somma
+        for(int i = 0; i < CH_COUNT; i++) {
+            _currentData.channels[i] = (newChannels[i] * EMA_ALPHA) + (_currentData.channels[i] * (1.0f - EMA_ALPHA));
+            newSum += _currentData.channels[i];
         }
+        _currentData.sum = newSum;
+
+        // Riavvia subito l'integrazione hardware per la prossima lettura (~28ms)
+        _sensor.startMeasurement();
     }
-    return false;
 }
 
-bool ColorManager::isRed() {
-    if (isBlack() || isSilver()) return false;
-
-    // Canali: 0=V, 1=B, 2=G, 3=Y, 4=O, 5=R
-    float normR = getNormalized(5); // Red
-    float normB = getNormalized(1); // Blue
-
-    // Il rosso ha una componente dominante nel canale R e bassa nel B
-    return (normR > 0.35f) && (normR > normB * 2.0f);
+void ColorManager::enableLed(bool state) {
+    if (state) _sensor.drvOn();
+    else _sensor.drvOff();
 }
 
-bool ColorManager::isBlue() {
-    if (isBlack() || isSilver()) return false;
-
-    float normB = getNormalized(1);
-    float normR = getNormalized(5);
-
-    // Il blu/ciano domina i canali bassi
-    return (normB > 0.30f) && (normB > normR * 1.5f);
+void ColorManager::setLedCurrent(uint8_t currentLevel) {
+    // AS7262 limits: 0: 12.5mA, 1: 25mA, 2: 50mA, 3: 100mA
+    if(currentLevel > 3) currentLevel = 3;
+    _sensor.setDrvCurrent(currentLevel);
 }
 
-bool ColorManager::isWhite() {
-    if (isBlack()) return false;
-
-    float normR = getNormalized(5);
-    float normB = getNormalized(1);
-
-    // Bianco = Spettro piatto (differenza tra R e B bassa) E non è argento
-    return (abs(normR - normB) < 0.15f) && !isSilver();
+void ColorManager::calibrate(ColorType type) {
+    switch(type) {
+        case COLOR_WHITE: _refWhite = _currentData; break;
+        case COLOR_RED:   _refRed = _currentData;   break;
+        case COLOR_BLUE:  _refBlue = _currentData;  break;
+        case COLOR_BLACK: _refBlack = _currentData; break; // <-- NUOVO
+        default: return;
+    }
+    saveCalibration(type, _currentData);
 }
+
+
+
+void ColorManager::exportCalibrationToSerial() const {
+
+    auto printData =[](const char* name, const SpectralData& d) {
+        Serial.printf("const float CALIB_%s_SUM = %.2ff;\n", name, d.sum);
+        Serial.printf("const float CALIB_%s_CH[6] = {%.2ff, %.2ff, %.2ff, %.2ff, %.2ff, %.2ff};\n\n",
+            name, d.channels[0], d.channels[1], d.channels[2], d.channels[3], d.channels[4], d.channels[5]);
+    };
+
+    printData("WHITE", _refWhite);
+    printData("BLACK", _refBlack);
+    printData("RED", _refRed);
+    printData("BLUE", _refBlue);
+
+}
+
+// ==========================================
+// ALGORITMI DI CLASSIFICAZIONE
+// ==========================================
+
 
 ColorType ColorManager::getDominantColor() {
-    if (isBlack()) return COLOR_BLACK;
-    if (isSilver()) return COLOR_SILVER; // Priorità alta (checkpoint)
-    if (isRed()) return COLOR_RED;
-    if (isBlue()) return COLOR_BLUE;
-    if (isWhite()) return COLOR_WHITE;
-    return COLOR_UNKNOWN;
+    // 1. ARGENTO: Basato sull'intensità estrema (Riflesso speculare)
+    if (_currentData.sum > (_refWhite.sum * DEFAULT_SILVER_RATIO)) {
+        return COLOR_SILVER;
+    }
+
+    // 2. NERO ASSOLUTO (Floor limit)
+    // Se la luce è quasi inesistente (es. il robot è sollevato in aria), è rumore.
+    // Nessun colore può essere calcolato con così poca luce.
+    const float ABSOLUTE_MIN_SUM = 15.0f;
+    if (_currentData.sum < ABSOLUTE_MIN_SUM) {
+        return COLOR_BLACK;
+    }
+
+    // 3. Calcolo Distanze Spettrali (forma del colore normalizzata)
+    float distWhite = calculateSpectralDistance(_currentData, _refWhite);
+    float distRed   = calculateSpectralDistance(_currentData, _refRed);
+    float distBlue  = calculateSpectralDistance(_currentData, _refBlue);
+
+    // 4. SMART SHADOW LOGIC (Per leggere i colori a >4cm di altezza)
+    float dynamicBlackThreshold = _refBlack.sum * 1.5f + 10.0f;
+
+    if (_currentData.sum < dynamicBlackThreshold) {
+        // ZONA D'OMBRA: C'è poca luce. Potrebbe essere nastro nero OPPURE un colore lontano.
+        // Guardiamo la "firma spettrale". Se l'errore quadratico rispetto al rosso/blu
+        // è molto basso (< 0.15), significa che la poca luce ha il colore purissimo.
+        const float SHAPE_CONFIDENCE = 0.15f;
+
+        if (distRed < SHAPE_CONFIDENCE && distRed < distBlue && distRed < distWhite) {
+            return COLOR_RED; // È buio, ma la traccia è chiaramente ROSSA
+        }
+        if (distBlue < SHAPE_CONFIDENCE && distBlue < distRed && distBlue < distWhite) {
+            return COLOR_BLUE; // È buio, ma la traccia è chiaramente BLU
+        }
+
+        // Se è buio e la luce non ha una firma netta (è "grigia" sporca), allora è vero NERO.
+        return COLOR_BLACK;
+    }
+
+    // 5. ZONA NORMALE (Pavimento vicino)
+    // Se la luce è abbondante, vince semplicemente chi ha la distanza matematica minore
+    if (distWhite < distRed && distWhite < distBlue) return COLOR_WHITE;
+    if (distRed < distWhite && distRed < distBlue) return COLOR_RED;
+    return COLOR_BLUE;
 }
 
-float ColorManager::getTemperature() {
-    float normR = getNormalized(5);
-    float normB = getNormalized(1);
+RGBColor ColorManager::getVisualRGB() const {
+    RGBColor output = {0, 0, 0};
 
-    // Formula approssimativa per CCT
-    float ratio = normB / (normR + 0.001f);
-    return ratio * 3000.0f + 2000.0f;
+    // Pesi per convertire i 6 canali spettrali in R, G, B umani
+    float r_mix = _currentData.channels[R] * 1.0f + _currentData.channels[O] * 0.7f + _currentData.channels[Y] * 0.4f + _currentData.channels[V] * 0.3f;
+    float g_mix = _currentData.channels[G] * 1.0f + _currentData.channels[Y] * 0.8f + _currentData.channels[B] * 0.3f;
+    float b_mix = _currentData.channels[B] * 1.0f + _currentData.channels[V] * 0.8f + _currentData.channels[G] * 0.2f;
+
+    // Auto-Gain per visualizzare il colore puro
+    float maxVal = max(r_mix, max(g_mix, b_mix));
+
+    if (maxVal > 5.0f) { // Evita rumore di fondo se è buio
+        output.r = (uint8_t)((r_mix / maxVal) * 255.0f);
+        output.g = (uint8_t)((g_mix / maxVal) * 255.0f);
+        output.b = (uint8_t)((b_mix / maxVal) * 255.0f);
+    }
+
+    return output;
+}
+bool ColorManager::isBlack()  { return getDominantColor() == COLOR_BLACK; }
+bool ColorManager::isSilver() { return getDominantColor() == COLOR_SILVER; }
+bool ColorManager::isWhite()  { return getDominantColor() == COLOR_WHITE; }
+bool ColorManager::isRed()    { return getDominantColor() == COLOR_RED; }
+bool ColorManager::isBlue()   { return getDominantColor() == COLOR_BLUE; }
+float ColorManager::getTemperature() {
+    // Metodo della libreria per leggere la temp sul chip (compensa derive termiche)
+    return _sensor.readTemperature();
+}
+
+const SpectralData& ColorManager::getCurrentData() const {
+    return _currentData;
+}
+
+float ColorManager::getBlackThreshold() const {
+    return _refBlack.sum * 1.5f + 10.0f;
+}
+
+// Calcola l'errore quadratico medio (distanza euclidea) su valori NORMALIZZATI.
+// Questo rende il rilevamento del colore indipendente dall'altezza/luce assoluta.
+float ColorManager::calculateSpectralDistance(const SpectralData& sample, const SpectralData& reference) {
+    if (sample.sum == 0 || reference.sum == 0) return 9999.0f;
+
+    float distance = 0.0f;
+    for(int i = 0; i < CH_COUNT; i++) {
+        float sampleNorm = sample.channels[i] / sample.sum;
+        float refNorm = reference.channels[i] / reference.sum;
+        float diff = sampleNorm - refNorm;
+        distance += (diff * diff);
+    }
+    return distance;
+}
+
+// ==========================================
+// NVM / FLASH MANAGEMENT
+// ==========================================
+
+void ColorManager::loadCalibration() {
+    _prefs.begin("color_calib", true); // RO mode
+
+    // Lettura (con fallback predefinito, simulato a 1.0/1000.0 se non presente per evitare divisioni per zero)
+    _refWhite.sum = _prefs.getFloat("w_sum", 1000.0f);
+    _refRed.sum   = _prefs.getFloat("r_sum", 1000.0f);
+    _refBlue.sum  = _prefs.getFloat("b_sum", 1000.0f);
+    _refBlack.sum = _prefs.getFloat("bk_sum", 30.0f);
+
+    for(int i=0; i<CH_COUNT; i++) {
+        String key = "ch_" + String(i);
+        _refWhite.channels[i] = _prefs.getFloat(("w_"+key).c_str(), 1000.0f / CH_COUNT);
+        _refRed.channels[i]   = _prefs.getFloat(("r_"+key).c_str(), 1000.0f / CH_COUNT);
+        _refBlue.channels[i]  = _prefs.getFloat(("b_"+key).c_str(), 1000.0f / CH_COUNT);
+        _refBlack.channels[i] = _prefs.getFloat(("bk_"+key).c_str(), 5.0f);
+    }
+    _prefs.end();
+}
+
+void ColorManager::saveCalibration(ColorType type, const SpectralData& data) {
+    _prefs.begin("color_calib", false); // RW mode
+    String prefix;
+    if (type == COLOR_WHITE) prefix = "w_";
+    else if (type == COLOR_RED) prefix = "r_";
+    else if (type == COLOR_BLUE) prefix = "b_";
+    else if (type == COLOR_BLACK) prefix = "bk_";
+    else return;
+
+    _prefs.putFloat((prefix + "sum").c_str(), data.sum);
+    for(int i=0; i<CH_COUNT; i++) {
+        _prefs.putFloat((prefix + "ch_" + String(i)).c_str(), data.channels[i]);
+    }
+    _prefs.end();
 }
